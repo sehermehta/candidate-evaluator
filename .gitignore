@@ -6,5 +6,7 @@ __pycache__/
 .streamlit/secrets.toml
 work/pycache/
 work/runs/
+work/
 outputs/*.csv
 outputs/*.xlsx
+outputs/
