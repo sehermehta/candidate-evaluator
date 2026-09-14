@@ -1,6 +1,19 @@
 # Deploying Candidate Evaluator To Streamlit Cloud
 
-This app is a Streamlit app. Deploy it on Streamlit Community Cloud, not Vercel.
+This app is a Streamlit app. It can run on Railway or Streamlit Community Cloud.
+
+## Railway
+
+1. Deploy this repository using the included Dockerfile.
+2. Add a persistent volume mounted at `/data`.
+3. Set `CANDIDATE_DATA_DIR=/data` and an `APP_PASSWORD` in service variables.
+4. Generate a public domain after the service is healthy.
+
+The app requires a password on Railway and stops before loading candidate data
+when the password is not configured. Each browser session must sign in. This is
+a single-team app: signed-in users share runs and results.
+The volume stores new runs and exports across deployments. Existing runs on your
+Mac are not uploaded with the application. Download exports as a separate backup.
 
 ## Before You Deploy
 

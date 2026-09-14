@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_PARALLEL_OPENAI_CALLS = 5
 
@@ -36,5 +39,6 @@ SOURCE_COLUMNS = [
     "Website",
 ]
 
-RUNS_DIR = "work/runs"
-OUTPUTS_DIR = "outputs"
+DATA_DIR = Path(os.environ.get("CANDIDATE_DATA_DIR", "."))
+RUNS_DIR = str(DATA_DIR / "work" / "runs")
+OUTPUTS_DIR = str(DATA_DIR / "outputs")

@@ -5,6 +5,8 @@ from typing import Any
 from html import escape
 import csv
 import io
+import os
+import hmac
 
 import streamlit as st
 
@@ -39,6 +41,7 @@ DEFAULT_SAMPLE_PATH = "/Users/sehermehta/Documents/Documents - Seher’s MacBook
 
 def main() -> None:
     st.set_page_config(page_title="Candidate Evaluator", layout="wide")
+    _require_access()
     st.title("Candidate Evaluator")
 
     with st.sidebar:
@@ -63,6 +66,27 @@ def main() -> None:
 
     _show_preview(candidates, rubric_text)
     _show_run_controls(candidates, rubric_text, role_key, model, int(parallel_calls), api_key, approved)
+
+
+def _require_access() -> None:
+    password = os.environ.get("APP_PASSWORD", "")
+    if not password:
+        if os.environ.get("RAILWAY_ENVIRONMENT_ID"):
+            st.error("App access has not been configured yet.")
+            st.stop()
+        return
+    if st.session_state.get("access_granted"):
+        return
+    with st.form("app_login"):
+        st.subheader("Candidate Evaluator")
+        entered = st.text_input("App password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if hmac.compare_digest(entered.encode(), password.encode()):
+            st.session_state["access_granted"] = True
+            st.rerun()
+        st.error("Incorrect password.")
+    st.stop()
 
 
 def _role_selector() -> str:
