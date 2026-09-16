@@ -6,7 +6,7 @@ from typing import Any, Optional
 from .roles import RoleProfile, get_role_profile
 
 
-def expected_outcome(total_score: int, role: RoleProfile) -> str:
+def expected_outcome(total_score: float, role: RoleProfile) -> str:
     for low, high, label in role.outcome_bands:
         if low <= total_score <= high:
             return label
@@ -22,7 +22,7 @@ def validate_output_row(row: dict[str, Any], role_key: str = "design") -> list[s
 
     category_scores = []
     for column, maximum in role.category_scores.items():
-        score = _as_int(row.get(column), column, errors)
+        score = _as_number(row.get(column), column, errors, integer_only=not role.numeric_scores)
         if score is None:
             continue
         allowed = role.allowed_scores.get(column)
@@ -32,38 +32,56 @@ def validate_output_row(row: dict[str, Any], role_key: str = "design") -> list[s
             errors.append(f"{column} must be between 0 and {maximum}; got {score}.")
         category_scores.append(score)
 
-    total = _as_int(row.get("Total Score"), "Total Score", errors)
+    total = _as_number(row.get(role.total_column), role.total_column, errors, integer_only=not role.numeric_scores)
     if total is not None:
         if total > role.total_max:
-            errors.append(f"Total Score must be no more than {role.total_max}; got {total}.")
-        if len(category_scores) == len(role.category_scores) and total != sum(category_scores):
-            errors.append(f"Total Score must equal category score sum {sum(category_scores)}; got {total}.")
-        try:
-            expected = expected_outcome(total, role)
-            actual = row.get(role.outcome_column)
-            if actual != expected:
-                errors.append(f"{role.outcome_column} must be {expected!r} for Total Score {total}; got {actual!r}.")
-        except ValueError as exc:
-            errors.append(str(exc))
+            errors.append(f"{role.total_column} must be no more than {role.total_max}; got {total}.")
+        if len(category_scores) == len(role.category_scores) and not _numbers_equal(total, sum(category_scores)):
+            errors.append(f"{role.total_column} must equal category score sum {sum(category_scores)}; got {total}.")
+        if role.outcome_bands:
+            try:
+                expected = expected_outcome(total, role)
+                actual = row.get(role.outcome_column)
+                if actual != expected:
+                    errors.append(f"{role.outcome_column} must be {expected!r} for {role.total_column} {total}; got {actual!r}.")
+            except ValueError as exc:
+                errors.append(str(exc))
 
-    evidence_values = [row.get(f"Strongest Evidence {i}", "") for i in range(1, 4)]
-    nonempty_evidence = [value for value in evidence_values if str(value or "").strip()]
-    if len(nonempty_evidence) > 3:
+    for column, allowed_values in (role.column_enums or {}).items():
+        if row.get(column) not in allowed_values:
+            errors.append(f"{column} must be one of {allowed_values}; got {row.get(column)!r}.")
+
+    evidence_columns = role.strongest_evidence_columns or [f"Strongest Evidence {i}" for i in range(1, 4)]
+    evidence_items = []
+    for column in evidence_columns:
+        value = str(row.get(column, "") or "").strip()
+        if not value:
+            continue
+        if len(evidence_columns) == 1:
+            evidence_items.extend(item.strip() for item in re.split(r"\s*(?:\||\n|•)\s*", value) if item.strip())
+        else:
+            evidence_items.append(value)
+    if len(evidence_items) > 3:
         errors.append("Strongest Evidence has more than three items.")
 
     rationale = str(row.get("Score Rationale", "") or "")
-    if _word_count(rationale) > 75:
-        errors.append(f"Score Rationale must be no longer than 75 words; got {_word_count(rationale)}.")
+    rationale_words = _word_count(rationale)
+    if role.rationale_min_words and rationale_words < role.rationale_min_words:
+        errors.append(f"Score Rationale must be at least {role.rationale_min_words} words; got {rationale_words}.")
+    if rationale_words > 75:
+        errors.append(f"Score Rationale must be no longer than 75 words; got {rationale_words}.")
 
     return errors
 
 
 def coerce_fixed_row(row: dict[str, Any], role_key: str = "design") -> dict[str, Any]:
     role = get_role_profile(role_key)
-    fixed = {column: row.get(column, "") for column in role.output_columns}
-    for column in list(role.category_scores) + ["Total Score"]:
+    columns = list(dict.fromkeys(role.output_columns + role.grading_columns))
+    fixed = {column: row.get(column, "") for column in columns}
+    numeric_columns = list(role.category_scores) + [role.total_column] + (role.ranking_tiebreaker_columns or [])
+    for column in numeric_columns:
         if fixed[column] != "":
-            fixed[column] = int(fixed[column])
+            fixed[column] = float(fixed[column]) if role.numeric_scores else int(fixed[column])
     return fixed
 
 
@@ -75,6 +93,22 @@ def _as_int(value: Any, name: str, errors: list[str]) -> Optional[int]:
     except (TypeError, ValueError):
         errors.append(f"{name} must be a whole number; got {value!r}.")
         return None
+
+
+def _as_number(value: Any, name: str, errors: list[str], integer_only: bool) -> Optional[float]:
+    if integer_only:
+        return _as_int(value, name, errors)
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        return float(value)
+    except (TypeError, ValueError):
+        errors.append(f"{name} must be a number; got {value!r}.")
+        return None
+
+
+def _numbers_equal(left: float, right: float) -> bool:
+    return abs(float(left) - float(right)) < 1e-9
 
 
 def _word_count(text: str) -> int:

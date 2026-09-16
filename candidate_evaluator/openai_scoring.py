@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import random
 import time
+from datetime import date
 from typing import Any, Optional
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
 
+from .extractor import merge_duplicate_experiences
 from .roles import RoleProfile, get_role_profile
 
 
@@ -47,7 +49,7 @@ def _call_with_backoff(
                         "content": json.dumps(
                             {
                                 "rubric": rubric_text,
-                                "candidate": _candidate_payload(candidate),
+                                "candidate": _candidate_payload(candidate, role),
                                 "instructions": role.instructions,
                             },
                             ensure_ascii=False,
@@ -98,7 +100,10 @@ def _retry_after_seconds(exc: Exception) -> Optional[float]:
         return None
 
 
-def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+def _candidate_payload(candidate: dict[str, Any], role: RoleProfile) -> dict[str, Any]:
+    experiences = candidate.get("experiences") or []
+    if role.key == "backend":
+        experiences = merge_duplicate_experiences(experiences)
     return {
         "LinkedIn Profile ID": candidate.get("linkedin_profile_id", ""),
         "LinkedIn URL": candidate.get("linkedin_url", ""),
@@ -108,14 +113,14 @@ def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
         "Website": candidate.get("website", ""),
         "Education 0": (candidate.get("education") or [""])[0] if candidate.get("education") else "",
         "Education 1": (candidate.get("education") or ["", ""])[1] if len(candidate.get("education") or []) > 1 else "",
-        "experiences": candidate.get("experiences") or [],
+        "experiences": experiences,
     }
 
 
 def _system_prompt(role: RoleProfile) -> str:
     maxima_text = ", ".join(f"{name}: {maximum}" for name, maximum in role.category_scores.items())
     allowed_text = "; ".join(f"{name}: {sorted(values)}" for name, values in role.allowed_scores.items())
-    prompt = f"{role.system_prompt} Category maxima: {maxima_text}."
+    prompt = f"{role.system_prompt} Evaluation date: {date.today().isoformat()}. Category maxima: {maxima_text}."
     if allowed_text:
         prompt += f" Allowed discrete score values: {allowed_text}."
     return prompt
@@ -181,7 +186,7 @@ def _response_schema(role: RoleProfile) -> dict[str, Any]:
                     ],
                     "properties": {
                         "category": {"type": "string"},
-                        "assigned_score": {"type": "integer"},
+                        "assigned_score": {"type": "number" if role.numeric_scores else "integer"},
                         "evidence_used": {"type": "string"},
                         "relevant_experience_indexes": {"type": "array", "items": {"type": "integer"}},
                         "applicable_score_band": {"type": "string"},
@@ -198,16 +203,28 @@ def _grading_properties(role: RoleProfile) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     for column in role.grading_columns:
         if column in role.category_scores:
-            schema: dict[str, Any] = {"type": "integer", "minimum": 0, "maximum": role.category_scores[column]}
+            schema: dict[str, Any] = {
+                "type": "number" if role.numeric_scores else "integer",
+                "minimum": 0,
+                "maximum": role.category_scores[column],
+            }
             if column in role.allowed_scores:
                 schema["enum"] = sorted(role.allowed_scores[column])
             properties[column] = schema
-        elif column == "Total Score":
-            properties[column] = {"type": "integer", "minimum": 0, "maximum": role.total_max}
-        elif column == role.outcome_column:
+        elif column == role.total_column:
+            properties[column] = {
+                "type": "number" if role.numeric_scores else "integer",
+                "minimum": 0,
+                "maximum": role.total_max,
+            }
+        elif column == role.outcome_column and role.outcome_bands:
             properties[column] = {"type": "string", "enum": [band[2] for band in role.outcome_bands]}
         elif column == "Evidence Confidence":
             properties[column] = {"type": "string", "enum": role.evidence_confidence_values}
+        elif role.column_enums and column in role.column_enums:
+            properties[column] = {"type": "string", "enum": role.column_enums[column]}
+        elif column in (role.ranking_tiebreaker_columns or []):
+            properties[column] = {"type": "number", "minimum": 0}
         elif column.endswith("— Months"):
             properties[column] = {"type": "integer", "minimum": 0}
         else:

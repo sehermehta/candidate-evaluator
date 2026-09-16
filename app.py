@@ -11,7 +11,13 @@ import hmac
 import streamlit as st
 
 from candidate_evaluator.constants import DEFAULT_MODEL, DEFAULT_PARALLEL_OPENAI_CALLS, MODEL_OPTIONS, OUTPUTS_DIR
-from candidate_evaluator.extractor import load_profiles, load_profiles_from_text, normalize_candidates, preview_candidates
+from candidate_evaluator.extractor import (
+    candidate_input_issues,
+    load_profiles,
+    load_profiles_from_text,
+    normalize_candidates,
+    preview_candidates,
+)
 from candidate_evaluator.progress import (
     candidate_status_rows,
     completed_preview_rows,
@@ -31,7 +37,7 @@ from candidate_evaluator.progress import (
     save_exports,
     set_current,
 )
-from candidate_evaluator.roles import DEFAULT_ROLE_KEY, role_options
+from candidate_evaluator.roles import DEFAULT_ROLE_KEY, prepare_output_rows, role_options
 from candidate_evaluator.validation import coerce_fixed_row, validate_output_row
 
 
@@ -49,8 +55,12 @@ def main() -> None:
         role_key = _role_selector()
         json_upload = st.file_uploader("LinkedIn JSON", type=["json"])
         sample_path = st.text_input("Or JSON file path", value=DEFAULT_SAMPLE_PATH if Path(DEFAULT_SAMPLE_PATH).exists() else "")
-        rubric_upload = st.file_uploader("Rubric Markdown", type=["md", "txt"])
-        rubric_path = st.text_input("Or rubric file path", value=DEFAULT_RUBRIC_PATH if Path(DEFAULT_RUBRIC_PATH).exists() else "")
+        rubric_upload = st.file_uploader("Rubric Markdown", type=["md", "txt"], key=f"rubric-upload-{role_key}")
+        rubric_path = st.text_input(
+            "Or rubric file path",
+            value=_default_rubric_path(role_key),
+            key=f"rubric-path-{role_key}",
+        )
         model = _model_selector()
         parallel_calls = st.number_input(
             "Parallel OpenAI calls",
@@ -133,6 +143,13 @@ def _parse_custom_models(raw_models: str) -> list[str]:
     return models
 
 
+def _default_rubric_path(role_key: str) -> str:
+    if role_key == "backend":
+        bundled = Path(__file__).parent / "rubrics" / "backend_engineer.md"
+        return str(bundled) if bundled.exists() else ""
+    return DEFAULT_RUBRIC_PATH if role_key == "design" and Path(DEFAULT_RUBRIC_PATH).exists() else ""
+
+
 def _load_inputs(json_upload: Any, sample_path: str, rubric_upload: Any, rubric_path: str) -> tuple[list[dict[str, Any]], str]:
     candidates: list[dict[str, Any]] = []
     rubric_text = ""
@@ -169,6 +186,16 @@ def _show_preview(candidates: list[dict[str, Any]], rubric_text: str) -> None:
     st.subheader("Extraction Preview")
     st.write(f"Candidates loaded: {len(candidates)}")
     st.write(f"Rubric loaded: {'yes' if rubric_text else 'no'}")
+    issues = candidate_input_issues(candidates)
+    if issues:
+        st.error("This JSON cannot be evaluated as candidate profiles.")
+        for issue in issues:
+            st.write(f"- {issue}")
+        st.info(
+            "Upload an Apify LinkedIn profile export containing candidate profile URLs such as "
+            "`https://www.linkedin.com/in/...` and populated headline/About/experience fields. "
+            "Evaluation is blocked to prevent wasted OpenAI credits."
+        )
     if st.button("Preview first five candidates", disabled=not candidates):
         st.session_state["preview"] = preview_candidates(candidates, limit=5)
     if st.session_state.get("preview"):
@@ -185,15 +212,27 @@ def _show_run_controls(
     approved: bool,
 ) -> None:
     st.subheader("Evaluation")
+    input_issues = candidate_input_issues(candidates)
     existing_run_options = run_select_options()
     selected_run_label = st.selectbox("Resume run", options=[""] + list(existing_run_options), index=0)
     selected_run = existing_run_options.get(selected_run_label, "")
+    selected_run_issues = candidate_input_issues(load_candidates(selected_run)) if selected_run else []
+    if selected_run_issues:
+        st.warning("This saved run used invalid candidate input. Its zero-score output should not be used.")
+        for issue in selected_run_issues:
+            st.write(f"- {issue}")
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        start_clicked = st.button("Start / resume evaluation", disabled=not candidates or not rubric_text)
+        start_clicked = st.button(
+            "Start / resume evaluation",
+            disabled=not candidates or not rubric_text or bool(input_issues),
+        )
     with col2:
-        retry_clicked = st.button("Retry failed candidates", disabled=not selected_run)
+        retry_clicked = st.button(
+            "Retry failed candidates",
+            disabled=not selected_run or bool(selected_run_issues),
+        )
     with col3:
         export_clicked = st.button("Save exports", disabled=not selected_run)
 
@@ -236,8 +275,15 @@ def _require_api_ready(api_key: str, approved: bool) -> None:
 def _run_evaluation(run_id: str, api_key: str, model: str, parallel_calls: int, retry_failed: bool) -> None:
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-    reset_running(run_id)
     candidates = load_candidates(run_id)
+    issues = candidate_input_issues(candidates)
+    if issues:
+        st.error("Evaluation stopped because the saved run does not contain usable LinkedIn candidate profiles.")
+        for issue in issues:
+            st.write(f"- {issue}")
+        st.info("Start a new run using an Apify LinkedIn profile export with `/in/...` profile URLs.")
+        st.stop()
+    reset_running(run_id)
     status = load_status(run_id)
     role_key = status.get("role", DEFAULT_ROLE_KEY)
     status_by_id = status.get("candidates", {})
@@ -324,7 +370,13 @@ def _evaluate_candidate_for_run(
         from candidate_evaluator.openai_scoring import evaluate_candidate
 
         grading, raw = evaluate_candidate(api_key=api_key, model=model, rubric_text=rubric_text, candidate=candidate, role_key=role_key)
-        row = {**candidate["source_row"], **grading}
+        role_source = {
+            **candidate["source_row"],
+            "Candidate": candidate.get("candidate_name", ""),
+            "Profile URL": candidate.get("linkedin_url", ""),
+            "Rank Number": "",
+        }
+        row = {**role_source, **grading}
         row = coerce_fixed_row(row, role_key)
         errors = validate_output_row(row, role_key)
         if errors:
@@ -422,7 +474,7 @@ def _show_downloads(run_id: str) -> None:
     rows = result_rows(run_id)
     if not rows:
         return
-    fixed_rows = [{column: row.get(column, "") for column in role.output_columns} for row in rows]
+    fixed_rows = prepare_output_rows(rows, role.key)
     csv_data = _rows_to_csv_bytes(fixed_rows, role.output_columns)
     st.subheader("Downloads")
     csv_col, excel_col = st.columns(2)

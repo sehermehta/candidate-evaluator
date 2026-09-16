@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - non-Unix fallback
     fcntl = None
 
 from .constants import OUTPUTS_DIR, RUNS_DIR
-from .roles import DEFAULT_ROLE_KEY, RoleProfile, get_role_profile
+from .roles import DEFAULT_ROLE_KEY, RoleProfile, get_role_profile, prepare_output_rows
 
 
 def make_run_id() -> str:
@@ -184,6 +184,8 @@ def candidate_status_rows(run_id: str, role_key: Optional[str] = None) -> list[d
     status = load_status(run_id)
     status_by_id = status.get("candidates", {})
     rows_by_id = result_rows_by_id(run_id)
+    ranked_rows = prepare_output_rows(list(rows_by_id.values()), role.key)
+    rank_by_url = {row.get("Profile URL"): row.get(role.outcome_column, "") for row in ranked_rows}
     rows = []
     for candidate in candidates:
         candidate_id = candidate["linkedin_profile_id"]
@@ -196,8 +198,12 @@ def candidate_status_rows(run_id: str, role_key: Optional[str] = None) -> list[d
             {
                 "Candidate Name": candidate.get("candidate_name") or source_row.get("Candidate Name") or candidate_id,
                 "Status": _display_state(state),
-                "Total Score": result.get("Total Score", ""),
-                role.outcome_column: result.get(role.outcome_column, ""),
+                role.total_column: result.get(role.total_column, ""),
+                role.outcome_column: (
+                    rank_by_url.get(result.get("Profile URL"), "")
+                    if role.ranked
+                    else result.get(role.outcome_column, "")
+                ),
                 "Error Message": status_by_id.get(candidate_id, {}).get("error", ""),
             }
         )
@@ -206,14 +212,15 @@ def candidate_status_rows(run_id: str, role_key: Optional[str] = None) -> list[d
 
 def completed_preview_rows(run_id: str, role_key: Optional[str] = None) -> list[dict[str, Any]]:
     role = role_for_run(run_id, role_key)
+    rows = prepare_output_rows(result_rows(run_id), role.key) if role.ranked else result_rows(run_id)
     return [
         {
-            "Candidate Name": row.get("Candidate Name", ""),
-            "Total Score": row.get("Total Score", ""),
+            "Candidate Name": row.get("Candidate Name") or row.get("Candidate", ""),
+            role.total_column: row.get(role.total_column, ""),
             role.outcome_column: row.get(role.outcome_column, ""),
             "Score Rationale": row.get("Score Rationale", ""),
         }
-        for row in result_rows(run_id)
+        for row in rows
     ]
 
 
@@ -258,7 +265,7 @@ def save_exports(run_id: str, rows: list[dict[str, Any]], role_key: Optional[str
     role = role_for_run(run_id, role_key)
     output_dir = Path(OUTPUTS_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows, columns=role.output_columns)
+    frame = pd.DataFrame(prepare_output_rows(rows, role.key), columns=role.output_columns)
     csv_path = output_dir / f"candidate_evaluation_{role.key}_{run_id}.csv"
     xlsx_path = output_dir / f"candidate_evaluation_{role.key}_{run_id}.xlsx"
     frame.to_csv(csv_path, index=False)

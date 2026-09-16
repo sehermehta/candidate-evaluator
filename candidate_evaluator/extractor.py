@@ -98,7 +98,61 @@ def preview_candidates(candidates: list[dict[str, Any]], limit: int = 5) -> list
     return preview
 
 
+def candidate_input_issues(candidates: list[dict[str, Any]]) -> list[str]:
+    """Return blocking problems that would make an API evaluation meaningless."""
+    post_records = []
+    empty_evidence_records = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("linkedin_profile_id") or candidate.get("source_index", "unknown"))
+        linkedin_url = str(candidate.get("linkedin_url") or "").casefold()
+        if any(marker in linkedin_url for marker in ("linkedin.com/posts/", "linkedin.com/feed/update/")):
+            post_records.append(candidate_id)
+        if not any(
+            (
+                candidate.get("headline"),
+                candidate.get("about"),
+                candidate.get("experiences"),
+            )
+        ):
+            empty_evidence_records.append(candidate_id)
+
+    issues = []
+    if post_records:
+        issues.append(
+            f"{len(post_records)} record(s) use LinkedIn post/activity URLs instead of candidate profile URLs."
+        )
+    if empty_evidence_records:
+        issues.append(
+            f"{len(empty_evidence_records)} record(s) contain no headline, About text, or experience entries to score."
+        )
+    return issues
+
+
+def merge_duplicate_experiences(experiences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    by_role: dict[tuple[str, ...], dict[str, Any]] = {}
+    for experience in experiences:
+        key = tuple(
+            str(experience.get(field, "")).strip().casefold()
+            for field in ("company_name", "position_or_title", "start_date", "end_date", "duration")
+        )
+        existing = by_role.get(key)
+        if existing is None:
+            existing = dict(experience)
+            existing["experience_skills"] = list(experience.get("experience_skills") or [])
+            by_role[key] = existing
+            merged.append(existing)
+            continue
+        descriptions = [existing.get("description", ""), experience.get("description", "")]
+        existing["description"] = " | ".join(dict.fromkeys(text for text in descriptions if text))
+        existing["experience_skills"] = list(
+            dict.fromkeys([*(existing.get("experience_skills") or []), *(experience.get("experience_skills") or [])])
+        )
+    return merged
+
+
 def _normalize_experience(exp: dict[str, Any], index: int) -> dict[str, Any]:
+    end_date = _format_date(exp.get("endDate"))
     return {
         "index": index,
         "company_name": _clean(exp.get("companyName")),
@@ -106,8 +160,11 @@ def _normalize_experience(exp: dict[str, Any], index: int) -> dict[str, Any]:
         "description": _clean(exp.get("description")),
         "employment_type": _clean(exp.get("employmentType")),
         "start_date": _format_date(exp.get("startDate")),
-        "end_date": _format_date(exp.get("endDate")),
+        "end_date": end_date,
+        "is_current": not end_date or end_date.casefold() in {"present", "current"},
         "duration": _clean(exp.get("duration")),
+        # Kept internal for rubrics that explicitly allow role-attached skills.
+        "experience_skills": _string_list(exp.get("skills")),
     }
 
 
@@ -167,3 +224,9 @@ def _clean(value: Any) -> str:
     if isinstance(value, str):
         return " ".join(value.split())
     return str(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_clean(item) for item in value if _clean(item)]
