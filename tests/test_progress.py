@@ -10,6 +10,7 @@ from candidate_evaluator.progress import (
     load_status,
     mark_completed,
     mark_failed,
+    mark_skipped,
     progress_counts,
     result_rows,
     role_for_run,
@@ -125,3 +126,24 @@ def test_backend_progress_uses_final_score_and_computed_rank(tmp_path: Path, mon
     assert status[1]["Rank Number"] == 1
     preview = completed_preview_rows("run-backend")
     assert [row["Candidate Name"] for row in preview] == ["B", "A"]
+
+
+def test_progress_tracks_skipped_without_exporting_it(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    candidates = [
+        {"source_index": 0, "linkedin_profile_id": "a", "source_row": {"Candidate Name": "A"}},
+        {"source_index": 1, "linkedin_profile_id": "b", "source_row": {"Candidate Name": "B"}},
+    ]
+    init_run("run-skip", candidates, "rubric", "model")
+    mark_completed("run-skip", "a", {"Candidate Name": "A"}, {"ok": True}, elapsed_seconds=10)
+    mark_skipped("run-skip", "b", "Skipped before API call: no experience entries.")
+
+    counts = progress_counts("run-skip")
+    assert counts["evaluated"] == 2
+    assert counts["completed"] == 1
+    assert counts["failed"] == 0
+    assert counts["skipped"] == 1
+    assert counts["remaining"] == 0
+    assert counts["avg_seconds_per_candidate"] == 10
+    assert result_rows("run-skip") == [{"Candidate Name": "A"}]
+    assert candidate_status_rows("run-skip")[1]["Status"] == "Skipped"

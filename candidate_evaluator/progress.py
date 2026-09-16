@@ -31,7 +31,7 @@ def init_run(run_id: str, candidates: list[dict[str, Any]], rubric_text: str, mo
     _write_json(path / "candidates.json", candidates)
     _write_json(path / "status.json", _initial_status(candidates, model, role_key))
     (path / "rubric.md").write_text(rubric_text, encoding="utf-8")
-    for name in ("rows.jsonl", "failed.jsonl", "raw_responses.jsonl"):
+    for name in ("rows.jsonl", "failed.jsonl", "skipped.jsonl", "raw_responses.jsonl"):
         (path / name).touch(exist_ok=True)
     return path
 
@@ -52,7 +52,10 @@ def run_select_options() -> dict[str, str]:
             continue
         role = get_role_profile(status.get("role", DEFAULT_ROLE_KEY))
         counts = _counts_from_status(status)
-        label = f"{run_id} — {role.label} — {counts['completed']} done / {counts['failed']} failed"
+        label = (
+            f"{run_id} — {role.label} — {counts['completed']} done / "
+            f"{counts['failed']} failed / {counts['skipped']} skipped"
+        )
         options[label] = run_id
     return options
 
@@ -130,6 +133,31 @@ def mark_failed(
         entry = status["candidates"].setdefault(candidate_id, {})
         entry.update({"state": "failed", "error": error, "updated_at": datetime.now().isoformat(timespec="seconds")})
         if elapsed_seconds is not None:
+            entry["elapsed_seconds"] = round(elapsed_seconds, 3)
+        _write_json(path / "status.json", status)
+
+
+def mark_skipped(
+    run_id: str,
+    candidate_id: str,
+    reason: str,
+    raw_response: Optional[dict[str, Any]] = None,
+    elapsed_seconds: Optional[float] = None,
+) -> None:
+    with _locked_run(run_id):
+        path = run_dir(run_id)
+        append_jsonl(
+            path / "skipped.jsonl",
+            {"candidate_id": candidate_id, "reason": reason, "raw_response": raw_response or {}},
+        )
+        status = load_status(run_id)
+        if status.get("_load_error"):
+            raise RuntimeError(f"Could not update skipped status for {candidate_id}: {status['_load_error']}")
+        entry = status["candidates"].setdefault(candidate_id, {})
+        entry.update({"state": "skipped", "error": reason, "updated_at": datetime.now().isoformat(timespec="seconds")})
+        if elapsed_seconds is None:
+            entry.pop("elapsed_seconds", None)
+        else:
             entry["elapsed_seconds"] = round(elapsed_seconds, 3)
         _write_json(path / "status.json", status)
 
@@ -237,13 +265,14 @@ def progress_counts(run_id: str) -> dict[str, Any]:
     completed_ids = set(result_rows_by_id(run_id))
     completed = len(completed_ids)
     failed = sum(1 for candidate_id, item in entries.items() if item.get("state") == "failed" and candidate_id not in completed_ids)
+    skipped = sum(1 for candidate_id, item in entries.items() if item.get("state") == "skipped" and candidate_id not in completed_ids)
     running = sum(1 for item in entries.values() if item.get("state") == "running")
     total = len(entries)
-    evaluated = completed + failed
+    evaluated = completed + failed + skipped
     elapsed_values = [
         float(item["elapsed_seconds"])
         for item in entries.values()
-        if item.get("state") in {"completed", "failed"} and item.get("elapsed_seconds") is not None
+        if item.get("state") in {"completed", "failed", "skipped"} and item.get("elapsed_seconds") is not None
     ]
     avg_seconds = sum(elapsed_values) / len(elapsed_values) if elapsed_values else 0.0
     return {
@@ -251,6 +280,7 @@ def progress_counts(run_id: str) -> dict[str, Any]:
         "evaluated": evaluated,
         "completed": completed,
         "failed": failed,
+        "skipped": skipped,
         "running": running,
         "remaining": max(total - evaluated, 0),
         "current_candidate": _running_candidate_names(run_id, entries),
@@ -291,6 +321,7 @@ def _counts_from_status(status: dict[str, Any]) -> dict[str, int]:
     return {
         "completed": sum(1 for item in entries.values() if item.get("state") == "completed"),
         "failed": sum(1 for item in entries.values() if item.get("state") == "failed"),
+        "skipped": sum(1 for item in entries.values() if item.get("state") == "skipped"),
     }
 
 
@@ -300,6 +331,7 @@ def _display_state(state: str) -> str:
         "running": "Running",
         "completed": "Done",
         "failed": "Failed",
+        "skipped": "Skipped",
     }.get(state, state.title())
 
 

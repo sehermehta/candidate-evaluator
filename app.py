@@ -5,6 +5,7 @@ from typing import Any
 from html import escape
 import csv
 import io
+import json
 import os
 import hmac
 
@@ -12,6 +13,7 @@ import streamlit as st
 
 from candidate_evaluator.constants import DEFAULT_MODEL, DEFAULT_PARALLEL_OPENAI_CALLS, MODEL_OPTIONS, OUTPUTS_DIR
 from candidate_evaluator.extractor import (
+    candidate_input_issue,
     candidate_input_issues,
     load_profiles,
     load_profiles_from_text,
@@ -27,6 +29,7 @@ from candidate_evaluator.progress import (
     make_run_id,
     mark_completed,
     mark_failed,
+    mark_skipped,
     progress_counts,
     reset_running,
     result_rows,
@@ -74,7 +77,7 @@ def main() -> None:
 
     candidates, rubric_text = _load_inputs(json_upload, sample_path, rubric_upload, rubric_path)
 
-    _show_preview(candidates, rubric_text)
+    _show_preview(candidates, rubric_text, role_key)
     _show_run_controls(candidates, rubric_text, role_key, model, int(parallel_calls), api_key, approved)
 
 
@@ -182,19 +185,19 @@ def _candidates_from_json_path(path: str, _mtime_ns: int) -> list[dict[str, Any]
     return normalize_candidates(load_profiles(path))
 
 
-def _show_preview(candidates: list[dict[str, Any]], rubric_text: str) -> None:
+def _show_preview(candidates: list[dict[str, Any]], rubric_text: str, role_key: str) -> None:
     st.subheader("Extraction Preview")
     st.write(f"Candidates loaded: {len(candidates)}")
     st.write(f"Rubric loaded: {'yes' if rubric_text else 'no'}")
-    issues = candidate_input_issues(candidates)
+    issues = candidate_input_issues(candidates, role_key)
     if issues:
-        st.error("This JSON cannot be evaluated as candidate profiles.")
+        skipped_count = sum(bool(candidate_input_issue(candidate, role_key)) for candidate in candidates)
+        st.warning(f"{skipped_count} of {len(candidates)} profile(s) will be skipped without an OpenAI call.")
         for issue in issues:
             st.write(f"- {issue}")
         st.info(
-            "Upload an Apify LinkedIn profile export containing candidate profile URLs such as "
-            "`https://www.linkedin.com/in/...` and populated headline/About/experience fields. "
-            "Evaluation is blocked to prevent wasted OpenAI credits."
+            "The remaining valid profiles can still be evaluated. Skipped records will be logged in the status table "
+            "and excluded from CSV/Excel. Optional fields such as Website or Education do not cause a skip."
         )
     if st.button("Preview first five candidates", disabled=not candidates):
         st.session_state["preview"] = preview_candidates(candidates, limit=5)
@@ -212,13 +215,13 @@ def _show_run_controls(
     approved: bool,
 ) -> None:
     st.subheader("Evaluation")
-    input_issues = candidate_input_issues(candidates)
     existing_run_options = run_select_options()
     selected_run_label = st.selectbox("Resume run", options=[""] + list(existing_run_options), index=0)
     selected_run = existing_run_options.get(selected_run_label, "")
-    selected_run_issues = candidate_input_issues(load_candidates(selected_run)) if selected_run else []
+    selected_run_role = role_for_run(selected_run).key if selected_run else role_key
+    selected_run_issues = candidate_input_issues(load_candidates(selected_run), selected_run_role) if selected_run else []
     if selected_run_issues:
-        st.warning("This saved run used invalid candidate input. Its zero-score output should not be used.")
+        st.warning("This saved run contains profile records that will be skipped.")
         for issue in selected_run_issues:
             st.write(f"- {issue}")
 
@@ -226,12 +229,12 @@ def _show_run_controls(
     with col1:
         start_clicked = st.button(
             "Start / resume evaluation",
-            disabled=not candidates or not rubric_text or bool(input_issues),
+            disabled=not candidates or not rubric_text,
         )
     with col2:
         retry_clicked = st.button(
             "Retry failed candidates",
-            disabled=not selected_run or bool(selected_run_issues),
+            disabled=not selected_run,
         )
     with col3:
         export_clicked = st.button("Save exports", disabled=not selected_run)
@@ -276,13 +279,6 @@ def _run_evaluation(run_id: str, api_key: str, model: str, parallel_calls: int, 
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     candidates = load_candidates(run_id)
-    issues = candidate_input_issues(candidates)
-    if issues:
-        st.error("Evaluation stopped because the saved run does not contain usable LinkedIn candidate profiles.")
-        for issue in issues:
-            st.write(f"- {issue}")
-        st.info("Start a new run using an Apify LinkedIn profile export with `/in/...` profile URLs.")
-        st.stop()
     reset_running(run_id)
     status = load_status(run_id)
     role_key = status.get("role", DEFAULT_ROLE_KEY)
@@ -295,21 +291,31 @@ def _run_evaluation(run_id: str, api_key: str, model: str, parallel_calls: int, 
     summary = st.empty()
 
     worklist = []
+    skipped_in_pass = 0
     for candidate in candidates:
         candidate_id = candidate["linkedin_profile_id"]
         state = status_by_id.get(candidate_id, {}).get("state", "pending")
+        input_issue = candidate_input_issue(candidate, role_key)
+        if input_issue and state != "completed" and candidate_id not in completed_row_ids:
+            mark_skipped(run_id, candidate_id, f"Skipped before API call: {input_issue}.")
+            skipped_in_pass += 1
+            continue
         if retry_failed and state == "failed":
             worklist.append(candidate)
-        elif not retry_failed and state != "completed" and candidate_id not in completed_row_ids:
+        elif not retry_failed and state not in {"completed", "skipped"} and candidate_id not in completed_row_ids:
             worklist.append(candidate)
 
     rubric_text = (run_dir(run_id) / "rubric.md").read_text(encoding="utf-8")
-    total = max(len(worklist), 1)
+    total = max(len(worklist) + skipped_in_pass, 1)
     max_workers = max(1, min(int(parallel_calls), len(worklist) or 1))
-    completed_in_pass = 0
+    completed_in_pass = skipped_in_pass
     pending = list(worklist)
     active: dict[Any, dict[str, Any]] = {}
-    message.info(f"Running up to {max_workers} candidates at a time.")
+    progress.progress(completed_in_pass / total)
+    message.info(
+        f"Running up to {max_workers} candidates at a time. "
+        f"Skipped {skipped_in_pass} unusable profile(s) without an API call."
+    )
     _render_live_status(run_id, dashboard, preview, summary, run_finished=False, parallel_calls=max_workers)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -325,6 +331,14 @@ def _run_evaluation(run_id: str, api_key: str, model: str, parallel_calls: int, 
                 result = future.result()
                 if result["state"] == "completed":
                     mark_completed(run_id, candidate_id, result["row"], result["raw"], result["elapsed_seconds"])
+                elif result["state"] == "skipped":
+                    mark_skipped(
+                        run_id,
+                        candidate_id,
+                        result["error"],
+                        raw_response=result.get("raw"),
+                        elapsed_seconds=result["elapsed_seconds"],
+                    )
                 else:
                     mark_failed(run_id, candidate_id, result["error"], elapsed_seconds=result["elapsed_seconds"])
                 completed_in_pass += 1
@@ -380,8 +394,20 @@ def _evaluate_candidate_for_run(
         row = coerce_fixed_row(row, role_key)
         errors = validate_output_row(row, role_key)
         if errors:
-            raise ValueError("; ".join(errors))
+            return {
+                "state": "skipped",
+                "error": "Skipped after API call because the grading output was incomplete or invalid: " + "; ".join(errors),
+                "raw": raw,
+                "elapsed_seconds": time.monotonic() - started,
+            }
         return {"state": "completed", "row": row, "raw": raw, "elapsed_seconds": time.monotonic() - started}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        return {
+            "state": "skipped",
+            "error": f"Skipped after API call because the grading output was empty or unreadable: {exc}",
+            "raw": {},
+            "elapsed_seconds": time.monotonic() - started,
+        }
     except Exception as exc:
         return {"state": "failed", "error": str(exc), "elapsed_seconds": time.monotonic() - started}
 
@@ -410,13 +436,14 @@ def _render_live_status(
     role = role_for_run(run_id)
     with dashboard.container():
         st.write(f"Evaluated: {counts['evaluated']} / {counts['total']}")
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
         col1.metric("Completed", counts["completed"])
         col2.metric("Failed", counts["failed"])
-        col3.metric("Remaining", counts["remaining"])
-        col4.metric("Total candidates", counts["total"])
-        col5.metric("Avg sec / candidate", _format_seconds(counts["avg_seconds_per_candidate"]))
-        col6.metric("Est. time remaining", _format_eta(counts, parallel_calls))
+        col3.metric("Skipped", counts["skipped"])
+        col4.metric("Remaining", counts["remaining"])
+        col5.metric("Total candidates", counts["total"])
+        col6.metric("Avg sec / candidate", _format_seconds(counts["avg_seconds_per_candidate"]))
+        col7.metric("Est. time remaining", _format_eta(counts, parallel_calls))
         st.write(f"Current candidate: {counts['current_candidate'] or 'None'}")
         _display_table(candidate_status_rows(run_id, role.key))
 
@@ -431,11 +458,12 @@ def _render_live_status(
     if run_finished:
         with summary.container():
             st.subheader("Run Summary")
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Total candidates", counts["total"])
             col2.metric("Completed", counts["completed"])
             col3.metric("Failed", counts["failed"])
-            col4.metric("Export ready", "yes" if counts["export_ready"] else "no")
+            col4.metric("Skipped", counts["skipped"])
+            col5.metric("Export ready", "yes" if counts["export_ready"] else "no")
 
 
 def _run_is_finished(run_id: str) -> bool:
@@ -474,6 +502,9 @@ def _show_downloads(run_id: str) -> None:
     rows = result_rows(run_id)
     if not rows:
         return
+    counts = progress_counts(run_id)
+    if counts.get("skipped"):
+        st.caption(f"{counts['skipped']} skipped profile(s) are logged in Evaluation Status and excluded from downloads.")
     fixed_rows = prepare_output_rows(rows, role.key)
     csv_data = _rows_to_csv_bytes(fixed_rows, role.output_columns)
     st.subheader("Downloads")

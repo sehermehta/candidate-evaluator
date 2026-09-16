@@ -98,22 +98,40 @@ def preview_candidates(candidates: list[dict[str, Any]], limit: int = 5) -> list
     return preview
 
 
-def candidate_input_issues(candidates: list[dict[str, Any]]) -> list[str]:
-    """Return blocking problems that would make an API evaluation meaningless."""
+def candidate_input_issue(candidate: dict[str, Any], role_key: str = "") -> str:
+    """Return why one record should be skipped before making an API call."""
+    reasons = []
+    linkedin_url = str(candidate.get("linkedin_url") or "").casefold()
+    if not candidate.get("candidate_name"):
+        reasons.append("candidate name is empty")
+    if not linkedin_url:
+        reasons.append("LinkedIn profile URL is empty")
+    elif any(marker in linkedin_url for marker in ("linkedin.com/posts/", "linkedin.com/feed/update/")):
+        reasons.append("URL is a LinkedIn post/activity rather than a candidate profile")
+    if role_key == "qa":
+        if not candidate.get("experiences"):
+            reasons.append("no experience entries are available for QA scoring")
+    elif not any((candidate.get("headline"), candidate.get("about"), candidate.get("experiences"))):
+        reasons.append("headline, About text, and experience entries are all empty")
+    return "; ".join(reasons)
+
+
+def candidate_input_issues(candidates: list[dict[str, Any]], role_key: str = "") -> list[str]:
+    """Summarize records that will be skipped without blocking valid records."""
     post_records = []
     empty_evidence_records = []
+    missing_identity_records = []
     for candidate in candidates:
         candidate_id = str(candidate.get("linkedin_profile_id") or candidate.get("source_index", "unknown"))
         linkedin_url = str(candidate.get("linkedin_url") or "").casefold()
         if any(marker in linkedin_url for marker in ("linkedin.com/posts/", "linkedin.com/feed/update/")):
             post_records.append(candidate_id)
-        if not any(
-            (
-                candidate.get("headline"),
-                candidate.get("about"),
-                candidate.get("experiences"),
-            )
-        ):
+        if not candidate.get("candidate_name") or not linkedin_url:
+            missing_identity_records.append(candidate_id)
+        lacks_evidence = not candidate.get("experiences") if role_key == "qa" else not any(
+            (candidate.get("headline"), candidate.get("about"), candidate.get("experiences"))
+        )
+        if lacks_evidence:
             empty_evidence_records.append(candidate_id)
 
     issues = []
@@ -121,9 +139,12 @@ def candidate_input_issues(candidates: list[dict[str, Any]]) -> list[str]:
         issues.append(
             f"{len(post_records)} record(s) use LinkedIn post/activity URLs instead of candidate profile URLs."
         )
+    if missing_identity_records:
+        issues.append(f"{len(missing_identity_records)} record(s) have an empty candidate name or LinkedIn profile URL.")
     if empty_evidence_records:
+        evidence_label = "experience entries required for QA scoring" if role_key == "qa" else "headline, About text, or experience entries"
         issues.append(
-            f"{len(empty_evidence_records)} record(s) contain no headline, About text, or experience entries to score."
+            f"{len(empty_evidence_records)} record(s) contain no {evidence_label} to score."
         )
     return issues
 
