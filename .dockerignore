@@ -4,5 +4,7 @@
 !app.py
 !candidate_evaluator/
 !candidate_evaluator/*.py
+!rubrics/
+!rubrics/*.md
 !.streamlit/
 !.streamlit/config.toml
