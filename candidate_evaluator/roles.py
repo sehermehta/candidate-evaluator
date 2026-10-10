@@ -18,10 +18,21 @@ class ComponentScoreRule:
     impact_column: str
     duration_column: str
     multiplier: float
+    evidence_maximum: int = 4
+    impact_maximum: int = 4
+    duration_maximum: int = 2
 
     @property
     def columns(self) -> tuple[str, str, str]:
         return (self.evidence_column, self.impact_column, self.duration_column)
+
+    @property
+    def column_maxima(self) -> tuple[tuple[str, int], tuple[str, int], tuple[str, int]]:
+        return (
+            (self.evidence_column, self.evidence_maximum),
+            (self.impact_column, self.impact_maximum),
+            (self.duration_column, self.duration_maximum),
+        )
 
 
 @dataclass(frozen=True)
@@ -72,9 +83,7 @@ class RoleProfile:
     def component_score_maxima(self) -> dict[str, int]:
         maxima: dict[str, int] = {}
         for rule in (self.component_scoring or {}).values():
-            maxima[rule.evidence_column] = 4
-            maxima[rule.impact_column] = 4
-            maxima[rule.duration_column] = 2
+            maxima.update(rule.column_maxima)
         return maxima
 
 
@@ -339,6 +348,77 @@ HEAD_SALES_WARNING_ENUMS = {
 }
 
 
+ZEISS_VISIOGEN_CAPABILITIES = [
+    ("US Market Sales Experience", 15, 1.5),
+    ("Lead Generation and New Business Prospecting", 15, 1.5),
+    ("Sales Pipeline Management and Conversion", 15, 1.5),
+    ("Key Account Management and Account Growth", 15, 1.5),
+    ("Customer Success and Consultative Selling", 10, 1.0),
+    ("Cross-Functional Coordination and Operational Execution", 5, 0.5),
+]
+
+ZEISS_VISIOGEN_CATEGORY_SCORES = OrderedDict(
+    (f"{name} Score (/{maximum})", maximum)
+    for name, maximum, _ in ZEISS_VISIOGEN_CAPABILITIES
+)
+
+ZEISS_VISIOGEN_COMPONENT_SCORING = OrderedDict(
+    (
+        f"{name} Score (/{maximum})",
+        ComponentScoreRule(
+            evidence_column=f"{name} — Evidence Points",
+            impact_column=f"{name} — Recency Points",
+            duration_column=f"{name} — Evidenced Duration Points",
+            multiplier=multiplier,
+            evidence_maximum=4,
+            impact_maximum=3,
+            duration_maximum=3,
+        ),
+    )
+    for name, maximum, multiplier in ZEISS_VISIOGEN_CAPABILITIES
+)
+
+ZEISS_VISIOGEN_COMPONENT_COLUMNS = [
+    column
+    for rule in ZEISS_VISIOGEN_COMPONENT_SCORING.values()
+    for column in rule.columns
+]
+
+ZEISS_VISIOGEN_WARNING_ENUMS = {
+    "US Market Sales Unverified": ["Yes", "No"],
+    "Lead Generation / Prospecting Unverified": ["Yes", "No"],
+    "Pipeline / Conversion Unverified": ["Yes", "No"],
+    "Key Account Management Unverified": ["Yes", "No"],
+    "Date-Quality Warning": ["Yes", "No"],
+}
+
+ZEISS_VISIOGEN_GRADING_COLUMNS = [
+    "Current Company",
+    "Current Title",
+    *ZEISS_VISIOGEN_CATEGORY_SCORES,
+    "Final Score (/75)",
+    *ZEISS_VISIOGEN_WARNING_ENUMS,
+    "Strongest Evidence",
+    "Missing or Unclear Information",
+    "Score Rationale",
+    *ZEISS_VISIOGEN_COMPONENT_COLUMNS,
+]
+
+ZEISS_VISIOGEN_OUTPUT_COLUMNS = [
+    "Rank Number",
+    "Candidate",
+    "Profile URL",
+    "Current Company",
+    "Current Title",
+    *ZEISS_VISIOGEN_CATEGORY_SCORES,
+    "Final Score (/75)",
+    *ZEISS_VISIOGEN_WARNING_ENUMS,
+    "Strongest Evidence",
+    "Missing or Unclear Information",
+    "Score Rationale",
+]
+
+
 ROLE_PROFILES = {
     "design": RoleProfile(
         key="design",
@@ -526,6 +606,52 @@ ROLE_PROFILES = {
             "company_name",
             "position_or_title",
             "description",
+            "start_date",
+            "end_date",
+            "is_current",
+            "duration",
+        ],
+    ),
+    "zeiss_visiogen": RoleProfile(
+        key="zeiss_visiogen",
+        label="ZEISS VisioGen: Account Executive - US Sales / Key Account Manager",
+        role_name="Account Executive - US Sales / Key Account Manager",
+        grading_columns=ZEISS_VISIOGEN_GRADING_COLUMNS,
+        category_scores=ZEISS_VISIOGEN_CATEGORY_SCORES,
+        allowed_scores={},
+        total_column="Final Score (/75)",
+        total_max=75,
+        outcome_column="Rank Number",
+        outcome_bands=[],
+        evidence_confidence_values=["High", "Medium", "Low"],
+        system_prompt="You are a strict LinkedIn evidence evaluator for the ZEISS VisioGen Account Executive - US Sales / Key Account Manager role.",
+        instructions=[
+            "Return Evidence, capability-specific Recency, and Evidenced Duration component points for all six capabilities; Python calculates every weighted capability score, final score, and rank.",
+            "Judge Recency separately for each capability; an unrelated current role does not make older capability evidence recent.",
+            "Employment type is supplied only for the rubric's duration exclusions; it earns no points.",
+            "Warnings do not change the score, and missing evidence must be described neutrally as unverified or not stated.",
+            "Return no more than three material Strongest Evidence points separated by ' | ' and keep Score Rationale to 50 words or fewer.",
+        ],
+        internal_role_flag_name="relevant_zeiss_visiogen_role",
+        internal_role_evidence_name="zeiss_visiogen_evidence_extracted",
+        export_columns=ZEISS_VISIOGEN_OUTPUT_COLUMNS,
+        numeric_scores=True,
+        ranked=True,
+        column_enums=ZEISS_VISIOGEN_WARNING_ENUMS,
+        ranking_tiebreaker_columns=list(ZEISS_VISIOGEN_CATEGORY_SCORES),
+        strongest_evidence_columns=["Strongest Evidence"],
+        rationale_min_words=0,
+        rationale_max_words=50,
+        evidence_sources=["Headline", "About", "All experiences"],
+        require_experience=False,
+        skip_if_no_evidence=True,
+        component_scoring=ZEISS_VISIOGEN_COMPONENT_SCORING,
+        experience_fields=[
+            "index",
+            "company_name",
+            "position_or_title",
+            "description",
+            "employment_type",
             "start_date",
             "end_date",
             "is_current",
