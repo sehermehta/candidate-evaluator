@@ -299,7 +299,7 @@ def _response_content(response: Any, provider: ProviderProfile) -> str:
 
 def _candidate_payload(candidate: dict[str, Any], role: RoleProfile) -> dict[str, Any]:
     experiences = candidate.get("experiences") or []
-    if role.key in {"backend", "ai_engineer_trj", "head_sales"}:
+    if role.key in {"backend", "ai_engineer_trj", "head_sales", "zeiss_visiogen"}:
         experiences = merge_duplicate_experiences(experiences)
     candidate = {**candidate, "experiences": experiences}
     payload = {
