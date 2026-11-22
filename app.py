@@ -11,6 +11,7 @@ import hmac
 
 import streamlit as st
 
+from candidate_evaluator.deduplication import scope_key, run_scope, completed_history, select_unique, evaluation_lock
 from candidate_evaluator.constants import DEFAULT_PARALLEL_OPENAI_CALLS
 from candidate_evaluator.extractor import (
     candidate_input_issue,
@@ -95,7 +96,7 @@ def main() -> None:
     custom_role_config, custom_role_errors = _custom_role_editor(role_key)
     role = None if custom_role_errors else get_role_profile(role_key, custom_role_config)
 
-    _show_preview(candidates, rubric_text, role)
+    _show_preview(candidates, rubric_text, role, custom_role_config)
     _show_run_controls(
         candidates,
         rubric_text,
@@ -435,13 +436,20 @@ def _candidates_from_json_path(
     )
 
 
-def _show_preview(candidates: list[dict[str, Any]], rubric_text: str, role: RoleProfile | None) -> None:
+def _show_preview(candidates: list[dict[str, Any]], rubric_text: str, role: RoleProfile | None, custom_role_config=None) -> None:
     st.subheader("Extraction Preview")
     st.write(f"Candidates loaded: {len(candidates)}")
     st.write(f"Rubric loaded: {'yes' if rubric_text else 'no'}")
     if role is None:
         st.warning("Complete the custom role setup before starting an evaluation.")
         return
+    try:
+        history = completed_history(scope_key(role.key, rubric_text, custom_role_config))
+        eligible, duplicates = select_unique(candidates, history, lambda c: _candidate_input_issue_for_role(c, role))
+        valid = sum(not _candidate_input_issue_for_role(c, role) for c in eligible)
+        st.info(f"Uploaded: {len(candidates)} · Eligible: {valid} · Duplicates skipped: {len(duplicates)}")
+    except (OSError, ValueError, RuntimeError) as exc:
+        st.warning(f"Could not check duplicate history: {exc}")
     if role.key == "fe_orange":
         st.caption(
             "Founding AI Engineer · 133 points. C1 and C10 include evidence, recency and duration; "
@@ -658,6 +666,22 @@ def _require_run_provider(run_id: str, provider_key: str) -> None:
 
 
 def _run_evaluation(run_id: str, api_key: str, parallel_calls: int, retry_failed: bool) -> None:
+    try:
+        role = role_for_run(run_id)
+        rubric = (run_dir(run_id) / "rubric.md").read_text(encoding="utf-8")
+        issue = rubric_input_issue(rubric, role)
+        if issue:
+            st.error(issue)
+            st.stop()
+        with evaluation_lock(run_scope(run_id)) as history:
+            _run_evaluation_locked(run_id, api_key, parallel_calls, retry_failed, history)
+    except (OSError, ValueError, RuntimeError) as exc:
+        st.error(f"Evaluation could not finish safely: {exc}")
+
+
+def _run_evaluation_locked(
+    run_id: str, api_key: str, parallel_calls: int, retry_failed: bool, history: dict[str, str],
+) -> None:
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     candidates = load_candidates(run_id)
@@ -681,12 +705,20 @@ def _run_evaluation(run_id: str, api_key: str, parallel_calls: int, retry_failed
     preview = st.empty()
     summary = st.empty()
 
+    candidates_to_check = [c for c in candidates if c["linkedin_profile_id"] not in completed_row_ids
+                           and status_by_id.get(c["linkedin_profile_id"], {}).get("state") != "completed"
+                           and (not retry_failed or status_by_id.get(c["linkedin_profile_id"], {}).get("state") == "failed")]
+    _, duplicates = select_unique(candidates_to_check, history, lambda c: _candidate_input_issue_for_role(c, role))
     worklist = []
     skipped_in_pass = 0
     for candidate in candidates:
         candidate_id = candidate["linkedin_profile_id"]
         status_entry = status_by_id.get(candidate_id, {})
         state = status_entry.get("state", "pending")
+        if candidate_id in duplicates:
+            mark_skipped(run_id, candidate_id, duplicates[candidate_id])
+            skipped_in_pass += 1
+            continue
         input_issue = _candidate_input_issue_for_role(candidate, role)
         if input_issue and state != "completed" and candidate_id not in completed_row_ids:
             mark_skipped(run_id, candidate_id, f"Skipped before API call: {input_issue}.")
@@ -700,7 +732,7 @@ def _run_evaluation(run_id: str, api_key: str, parallel_calls: int, retry_failed
             and candidate_id not in completed_row_ids
             and (
                 state != "skipped"
-                or str(status_entry.get("error", "")).startswith("Skipped before API call:")
+                or str(status_entry.get("error", "")).startswith(("Skipped before API call:", "Duplicate:"))
             )
         ):
             worklist.append(candidate)
@@ -716,7 +748,7 @@ def _run_evaluation(run_id: str, api_key: str, parallel_calls: int, retry_failed
     message.info(
         f"Running up to {max_workers} {provider.label} batch call(s) at a time, "
         f"with up to {BATCH_SIZE} candidates per call. "
-        f"Skipped {skipped_in_pass} unusable profile(s) without an API call."
+        f"Skipped {skipped_in_pass} duplicate or unusable profile(s) without an API call."
     )
     if role.key == "sde3":
         message.info(
