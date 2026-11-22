@@ -65,3 +65,38 @@ Do not upload:
 ## Important Cloud Note
 
 Streamlit Cloud storage is not meant to be permanent. Always download CSV/Excel outputs after a run.
+
+## Role-level repeat protection
+
+The evaluator skips repeat profile IDs within an upload and profiles successfully
+scored in any saved run for the same role and rubric. Custom role configurations
+have separate histories. Changing the rubric permits another evaluation; changing
+only the model or provider does not. Duplicates appear in Evaluation Status with
+the source run and are excluded from CSV/Excel. Failed evaluations remain retryable.
+Profiles without a stable source ID are never matched across uploads by row number.
+
+Successful run receipts/results are the source of truth. The app rebuilds a
+role/rubric registry under `$CANDIDATE_DATA_DIR/work/evaluation_registry` before
+scoring, including existing saved runs. A process-level lock prevents simultaneous
+passes for the same role/rubric while preserving parallel scoring within a pass.
+An overlapping pass shows a message to retry after the active pass finishes.
+Locks release on interruption, and saved batch receipts are recovered before the
+next pass. Keep a single Railway replica sharing the persistent `/data` volume.
+Unreadable history blocks scoring rather than silently charging for repeats.
+
+### Moving an existing Railway service to persistent storage
+
+Before applying the staged volume or deploying code, stop starting new evaluations
+and let active evaluations finish. Using Railway SSH, determine the current
+`CANDIDATE_DATA_DIR` (default `/app` when unset) and copy its `work/runs` and
+`outputs` directories **off the running container**. Verify the backup contains
+`candidates.json`, `status.json`, `rubric.md`, result files and any batch receipts
+for every available run. Do not rely on the ephemeral container surviving deploy.
+
+Apply the `/data` volume and `CANDIDATE_DATA_DIR=/data`, then restore the backup to
+`/data/work/runs` and `/data/outputs` before allowing evaluations. Deploy the code
+and verify the preview recognizes one previously completed profile for its original
+role/rubric. Restart the service and repeat the check to verify persistence. Existing
+exports and run results are retained unchanged. History already lost from previous
+containers cannot be reconstructed. To roll back code, retain the volume and data
+variable; do not remove the history.

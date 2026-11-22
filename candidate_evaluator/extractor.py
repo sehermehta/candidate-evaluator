@@ -192,6 +192,7 @@ def normalize_candidates(
     next_suffix: dict[str, int] = {}
     for candidate in candidates:
         candidate_id = str(candidate["linkedin_profile_id"])
+        candidate["original_profile_id"] = candidate_id
         unique_id = candidate_id
         if unique_id in used_ids:
             suffix = next_suffix.get(candidate_id, 2)
